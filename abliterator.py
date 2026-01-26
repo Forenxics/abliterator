@@ -67,7 +67,8 @@ def directional_hook(
 
 def clear_mem():
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 def measure_fn(measure: str, input_tensor: Tensor, *args, **kwargs) -> Float[Tensor, '...']:
     avail_measures = {
@@ -248,12 +249,12 @@ class ModelAbliterator:
         return dirs
 
     def get_avg_projections(self, key: str, direction: Float[Tensor, 'd_model']) -> Tuple[Float[Tensor, 'd_model'], Float[Tensor, 'd_model']]:
-        dirs = self.calculate_mean_dirs(self,key)
+        dirs = self.calculate_mean_dirs(key)
         return (torch.dot(dirs['harmful_mean'], direction), torch.dot(dirs['harmless_mean'], direction))
 
-    def get_layer_dirs(self, layer, key: str = None, include_overall_mean: bool=False) -> Dict[str, Float[Tensor, 'd_model']]:
+    def get_layer_dirs(self, layer: int, key: str = None, include_overall_mean: bool=False) -> Dict[str, Float[Tensor, 'd_model']]:
         act_key = key or self.activation_layers[0]
-        if len(self.harmfuls[key]) < layer:
+        if len(self.harmful) < layer:
             raise IndexError("Invalid layer")
         return self.calculate_mean_dirs(utils.get_act_name(act_key, layer), include_overall_mean=include_overall_mean)
 
@@ -282,7 +283,7 @@ class ModelAbliterator:
             # make sure device doesn't change
             self.modified = True
             self.model.blocks[layer].attn.W_O.data = replacement.to(self.model.blocks[layer].attn.W_O.device)
-            self.modified_layers['W_O'][layer] = self.modified_layers.get(layer,[])+[(self.model.blocks[layer].attn.W_O.data.to('cpu'),replacement.to('cpu'))]
+            self.modified_layers['W_O'][layer] = self.modified_layers['W_O'].get(layer,[])+[(self.model.blocks[layer].attn.W_O.data.to('cpu'),replacement.to('cpu'))]
         return self.model.blocks[layer].attn.W_O.data
 
     def layer_mlp(self, layer: int, replacement: Float[Tensor, "d_model"] = None) -> Float[Tensor, "d_model"]:
@@ -290,7 +291,7 @@ class ModelAbliterator:
             # make sure device doesn't change
             self.modified = True
             self.model.blocks[layer].mlp.W_out.data = replacement.to(self.model.blocks[layer].mlp.W_out.device)
-            self.modified_layers['mlp'][layer] = self.modified_layers.get(layer,[])+[(self.model.blocks[layer].mlp.W_out.data.to('cpu'),replacement.to('cpu'))]
+            self.modified_layers['mlp'][layer] = self.modified_layers['mlp'].get(layer,[])+[(self.model.blocks[layer].mlp.W_out.data.to('cpu'),replacement.to('cpu'))]
         return self.model.blocks[layer].mlp.W_out.data
 
     def tokenize_instructions_fn(
@@ -481,7 +482,8 @@ class ModelAbliterator:
             print("WARNING: Modified; will restore model to current modified state each run")
         scores = []
         for direction in tqdm(dirs.items()):
-            score = self.test_dir(direction[1],N=N,use_hooks=use_hooks)[int(positive)]
+            score_key = 'positive' if positive else 'negative'
+            score = self.test_dir(direction[1],N=N,use_hooks=use_hooks)[score_key]
             scores.append((score,direction))
         return sorted(scores,key=lambda x:x[0])
 
@@ -515,8 +517,11 @@ class ModelAbliterator:
         max_negative_score_per_sequence = torch.max(normalized_negative,dim=-1)[0]
         max_positive_score_per_sequence = torch.max(normalized_positive,dim=-1)[0]
 
-        negative_score_per_batch = measure_fn(measure,max_negative_score_per_sequence,dim=-1)[0]
-        positive_score_per_batch = measure_fn(measure,max_positive_score_per_sequence,dim=-1)[0]
+        negative_result = measure_fn(measure,max_negative_score_per_sequence,dim=-1)
+        positive_result = measure_fn(measure,max_positive_score_per_sequence,dim=-1)
+        # Handle functions that return (values, indices) tuple vs scalar
+        negative_score_per_batch = negative_result[0] if isinstance(negative_result, tuple) else negative_result
+        positive_score_per_batch = positive_result[0] if isinstance(positive_result, tuple) else positive_result
         return negative_score_per_batch,positive_score_per_batch
 
     def do_resid(self, fn_name: str) -> Tuple[Float[Tensor, 'layer batch d_model'], Float[Tensor, 'layer batch d_model'], List[str]]:
@@ -560,7 +565,7 @@ class ModelAbliterator:
         harmful_set = torch.isin(sorted_harmful_indices, torch.tensor(list(token_set)))
         harmless_set = torch.isin(sorted_harmless_indices, torch.tensor(list(token_set if token_set_b is None else token_set_b)))
 
-        indices_in_set = zip(harmful_set.nonzero(as_tuple=True)[1],harmless_set.nonzero(as_tuple=True)[1])
+        indices_in_set = list(zip(harmful_set.nonzero(as_tuple=True)[1],harmless_set.nonzero(as_tuple=True)[1]))
         return indices_in_set
 
     def mse_positive(
@@ -665,7 +670,7 @@ class ModelAbliterator:
 
         last_indices = last_indices or 1
 
-        self.harmful,self.harmful_z_label = self.create_activation_cache(harmful_toks,N=N,batch_size=batch_size,last_indices=last_indices,measure_refusal=measure_refusal,stop_at_layer=None)
+        self.harmful,self.harmful_z_label = self.create_activation_cache(harmful_toks,N=N,batch_size=batch_size,last_indices=last_indices,measure_refusal=measure_refusal,stop_at_layer=stop_at_layer)
         if not preserve_harmless:
-            self.harmless, self.harmless_z_label = self.create_activation_cache(harmless_toks,N=N,batch_size=batch_size,last_indices=last_indices,measure_refusal=measure_refusal,stop_at_layer=None)
+            self.harmless, self.harmless_z_label = self.create_activation_cache(harmless_toks,N=N,batch_size=batch_size,last_indices=last_indices,measure_refusal=measure_refusal,stop_at_layer=stop_at_layer)
 
