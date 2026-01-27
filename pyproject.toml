@@ -1,19 +1,88 @@
 [project]
 name = "abliterator"
-version = "0.0.0"
+version = "0.1.0"
 description = "Python library for transformer activation steering and ablation."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {file = "LICENSE"}
 
-keywords = ["transformers", "steering", "ablation", "interpretability", "machine learning"]
+keywords = [
+    "transformers",
+    "steering",
+    "ablation",
+    "interpretability",
+    "machine learning",
+    "llm",
+    "activation-steering"
+]
 
-authors = []
+authors = [
+    {name = "FailSpy"}
+]
 
 maintainers = []
 
-dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.3.0",
+    "einops>=0.8.0",
+    "datasets>=2.19.1",
+    "scikit-learn>=1.5.0",
+    "tqdm>=4.66.4",
+    "transformer-lens @ git+https://github.com/TransformerLensOrg/TransformerLens.git@dev",
+    "transformers>=4.41.1",
+    "jaxtyping>=0.2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Forenxics/abliterator"
+Repository = "https://github.com/Forenxics/abliterator"
+Issues = "https://github.com/Forenxics/abliterator/issues"
 
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.black]
+line-length = 120
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
