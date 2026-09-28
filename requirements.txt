@@ -2,7 +2,11 @@ torch>=2.3.0
 einops>=0.8.0
 datasets>=2.19.1
 scikit-learn>=1.5.0
-tqdm>=4.66.4 
-transformer-lens @ git+https://github.com/TransformerLensOrg/TransformerLens.git@dev
+tqdm>=4.66.4
+# transformer_lens 4.0 removed HookedTransformer (replaced by TransformerBridge);
+# this codebase uses the pre-4.0 API, so it's pinned below 4.0. Tracking the
+# `@dev` branch is what broke this: `dev` now points at the same 4.0 rewrite.
+# See https://github.com/TransformerLensOrg/TransformerLens/blob/main/docs/source/content/migrating_to_v4.md
+transformer_lens>=3.0.0,<4.0.0
 transformers>=4.41.1
-jaxtyping>=0.2.28 
+jaxtyping>=0.2.28

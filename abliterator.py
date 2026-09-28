@@ -182,10 +182,16 @@ def measure_fn(measure: str, input_tensor: Tensor, *args, **kwargs) -> Float[Ten
 
     result = avail_measures[measure](input_tensor, *args, **kwargs)
 
-    # Handle namedtuple returns from max, min, median when dim is specified
-    if hasattr(result, 'values'):
-        return result.values
-    return result
+    # torch.max/min/median return a plain Tensor when no `dim` is given, but a
+    # (values, indices) namedtuple-like when `dim` is given. `hasattr(result,
+    # 'values')` is NOT a safe way to tell these apart: every torch.Tensor
+    # also exposes a `.values` bound method (part of the sparse-tensor API),
+    # so that check fires for plain tensors too and silently returns the
+    # unbound method instead of the tensor. Checking the type directly avoids
+    # that trap.
+    if isinstance(result, Tensor):
+        return result
+    return result.values
 
 class ChatTemplate:
     """A context manager for temporarily managing chat templates.
@@ -275,12 +281,18 @@ class ModelAbliterator:
         activation_layers: List[str] = ['resid_pre', 'resid_post', 'mlp_out', 'attn_out'],
         chat_template: Optional[str] = None,
         positive_toks: Optional[TokenSet] = None,
-        negative_toks: Optional[TokenSet] = None
+        negative_toks: Optional[TokenSet] = None,
+        hf_model: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
+        dtype: torch.dtype = torch.bfloat16
     ):
         """Initialize the ModelAbliterator.
 
         Args:
-            model: HuggingFace model path or name.
+            model: HuggingFace model path or name, used to resolve which
+                TransformerLens architecture/config to build (e.g. "gpt2",
+                "meta-llama/Meta-Llama-3-8B-Instruct"). If `hf_model` is not
+                given, weights are also downloaded from this name/path.
             dataset: Tuple of (harmful_dataset, harmless_dataset), where each dataset
                 is either a pre-split (train, test) tuple or a list to be split.
             device: Device to load the model on ('cuda' or 'cpu').
@@ -290,6 +302,16 @@ class ModelAbliterator:
             chat_template: Custom chat template string with {instruction} placeholder.
             positive_toks: Token IDs indicating positive/compliant responses.
             negative_toks: Token IDs indicating negative/refusal responses.
+            hf_model: Optional pre-loaded HuggingFace model instance to wrap
+                instead of downloading `model` from the Hub. Use this for
+                local/offline weights (e.g. `AutoModelForCausalLM.from_pretrained(
+                "/path/to/local/model")`). `model` must still name the
+                TransformerLens-recognized architecture the checkpoint is based on.
+            tokenizer: Optional pre-loaded tokenizer to use instead of downloading
+                one for `model`. Required alongside `hf_model` for fully offline use.
+            dtype: Torch dtype to load the model in. Defaults to bfloat16;
+                use float32 (or float16) on hardware/backends without good
+                bfloat16 support, e.g. most CPUs.
         """
         self.MODEL_PATH = model
         if n_devices is None and torch.cuda.is_available():
@@ -302,9 +324,11 @@ class ModelAbliterator:
 
         self.model = HookedTransformer.from_pretrained_no_processing(
             model,
+            hf_model=hf_model,
+            tokenizer=tokenizer,
             n_devices=n_devices,
             device=device,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             default_padding_side='left'
         )
 
