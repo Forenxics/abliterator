@@ -798,6 +798,15 @@ class ModelAbliterator:
         sequence: int,
         measure: str = 'max'
     ) -> Tuple[Float[Tensor, 'batch_size'], Float[Tensor, 'batch_size']]:
+        d_vocab = logits.shape[-1]
+        out_of_range = sorted(t for t in list(self.positive_toks) + list(self.negative_toks) if t < 0 or t >= d_vocab)
+        if out_of_range:
+            raise ValueError(
+                f"positive_toks/negative_toks contain token ID(s) {out_of_range} outside this model's "
+                f"vocabulary (size {d_vocab}). The defaults are Llama-3 vocabulary IDs, which don't fit "
+                f"every model -- pass your own positive_toks/negative_toks (token IDs valid for this "
+                f"model's own tokenizer) to ModelAbliterator(...)."
+            )
         normalized_scores = torch.softmax(logits[:,-sequence:,:].to('cpu'),dim=-1)[:,:,list(self.positive_toks)+list(self.negative_toks)]
 
         normalized_positive,normalized_negative = torch.split(normalized_scores,[len(self.positive_toks), len(self.negative_toks)], dim=2)
