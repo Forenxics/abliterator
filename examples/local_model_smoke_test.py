@@ -24,7 +24,14 @@ cache (set HF_HOME to point at it, and HF_HUB_OFFLINE=1 to force local-only
 resolution with a clear error instead of a network attempt).
 """
 import argparse
+import os
 import sys
+
+# Running this script directly only puts its own directory (examples/) on
+# sys.path, not the repo root where abliterator.py lives. Add the repo root
+# explicitly so `import abliterator` works regardless of the current working
+# directory or how the script is invoked.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
