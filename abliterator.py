@@ -5,6 +5,11 @@ This module provides tools for discovering and applying activation steering
 interventions to Large Language Models (LLMs) to control behavior, particularly
 for studying harmful/harmless outputs by calculating directions in activation space.
 """
+# Deferred annotation evaluation (PEP 563): required so the `X | Y` union syntax
+# used throughout this module's type hints doesn't crash at import time on
+# Python < 3.10, where `|` is not yet supported between typing generics/types.
+from __future__ import annotations
+
 import logging
 import torch
 import torch.nn.functional as F
@@ -12,8 +17,6 @@ import functools
 import einops
 import gc
 import re
-import warnings
-from dataclasses import dataclass, field
 from itertools import islice
 from typing import (
     Any,
@@ -41,8 +44,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 logger = logging.getLogger(__name__)
 
 # Type aliases for common types
-TensorDict = Dict[str, Tensor]
-LayerList = List[int]
 TokenSet = Union[List[int], Tuple[int, ...], Set[int], Int[Tensor, '...']]
 InstructionList = List[str]
 DatasetSplit = Tuple[InstructionList, InstructionList]
@@ -111,14 +112,16 @@ def prepare_dataset(dataset: Tuple[List[str], List[str]] | List[str]) -> Tuple[L
     Returns:
         Tuple of (train_list, test_list)
     """
-    # Check if dataset is already split into (train, test) tuple
+    # Check if dataset is already split into a (train, test) tuple. Per the
+    # documented type contract, the flat/unsplit form is always a List, never
+    # a tuple, so checking for a 2-tuple of lists is sufficient and (unlike a
+    # non-empty/content check) doesn't misclassify a presplit dataset that
+    # happens to have an empty train or test list.
     is_presplit = (
         isinstance(dataset, tuple) and
         len(dataset) == 2 and
         isinstance(dataset[0], list) and
-        isinstance(dataset[1], list) and
-        len(dataset[0]) > 0 and
-        isinstance(dataset[0][0], str)
+        isinstance(dataset[1], list)
     )
 
     if is_presplit:
@@ -543,24 +546,30 @@ class ModelAbliterator:
         **kwargs
     ) -> Tuple[Float[Tensor, 'batch_size seq_len d_vocab'], Int[Tensor, 'batch_size seq_len']]:
         # does most of the model magic
-        all_toks = torch.zeros((toks.shape[0],toks.shape[1]+max_tokens_generated), dtype=torch.long, device=toks.device)
-        all_toks[:, :toks.shape[1]] = toks
-        generating = [i for i in range(toks.shape[0])]
+        #
+        # NOTE: the model is always run on the full batch each step. `generating`
+        # only tracks which rows are still active (haven't hit EOS yet); it
+        # gates which rows get new tokens written and which count toward the
+        # refusal check. This keeps the returned `logits` batch-aligned with
+        # `toks` — shrinking the forward pass itself would make `logits` cover
+        # fewer/reordered rows once any sequence finishes early, silently
+        # breaking any caller that indexes it by original batch position.
+        batch_size, prompt_len = toks.shape
+        all_toks = torch.zeros((batch_size, prompt_len + max_tokens_generated), dtype=torch.long, device=toks.device)
+        all_toks[:, :prompt_len] = toks
+        generating = set(range(batch_size))
         for i in range(max_tokens_generated):
-            logits = self.model(all_toks[generating, :-max_tokens_generated + i],*args,**kwargs)
-            next_tokens = logits[:,-1,:].argmax(dim=-1).to('cpu')
-            all_toks[generating,-max_tokens_generated+i] = next_tokens
-            if drop_refusals and any(negative_tok in next_tokens for negative_tok in self.negative_toks):
+            write_pos = prompt_len + i
+            logits = self.model(all_toks[:, :write_pos], *args, **kwargs)
+            next_tokens = logits[:, -1, :].argmax(dim=-1).to('cpu')
+            active_idx = sorted(generating)
+            all_toks[active_idx, write_pos] = next_tokens[active_idx]
+            if drop_refusals and any(negative_tok in next_tokens[active_idx] for negative_tok in self.negative_toks):
                 # refusals we handle differently: if it's misbehaving, we stop all batches and move on to the next one
                 break
             if stop_at_eos:
-                # Filter out batches that have generated EOS token at the current position
-                current_pos = -max_tokens_generated + i
-                generating = [
-                    idx for idx in generating
-                    if all_toks[idx, current_pos] != self.model.tokenizer.eos_token_id
-                ]
-                if len(generating) == 0:
+                generating = {idx for idx in generating if all_toks[idx, write_pos] != self.model.tokenizer.eos_token_id}
+                if not generating:
                     break
         return logits, all_toks
 
@@ -712,9 +721,12 @@ class ModelAbliterator:
                 activation_layers = self.activation_layers
 
             if use_hooks:
-                hooks = self.fwd_hooks
                 hook_fn = functools.partial(directional_hook,direction=refusal_dir)
-                self.fwd_hooks = before_hooks+[(act_name,hook_fn) for ln,act_name in self.get_all_act_names()]
+                self.fwd_hooks = before_hooks+[
+                    (act_name,hook_fn)
+                    for ln,act_name in self.get_all_act_names(activation_layers)
+                    if ln in layers
+                ]
                 return self.measure_scores(**kwargs)
             else:
                 with self:
