@@ -520,29 +520,60 @@ class ModelAbliterator:
         if not self.harmful:
             raise IndexError("No cache. Run cache_activations first.")
 
-        # Don't include layer 0 as it often becomes NaN
-        refusal_dirs = {key: self.calculate_mean_dirs(key) for key in self.harmful if '.0.' not in key}
+        # Don't include layer 0 (often becomes NaN), and only consider activations
+        # that are actually per-position d_model vectors (resid_pre/resid_post/
+        # mlp_out/attn_out, the usual targets). cache_activations(activation_layers=None)
+        # (needed for do_resid/decomposed_resid) also caches things like
+        # ln_final.hook_scale or attention patterns, which aren't valid ablation
+        # directions at all -- applying one via test_dir/apply_refusal_dirs would
+        # crash on a shape mismatch rather than silently doing something meaningless.
+        refusal_dirs = {
+            key: self.calculate_mean_dirs(key)
+            for key in self.harmful
+            if '.0.' not in key and self.harmful[key].shape[-1] == self.hidden_size
+        }
         if invert:
             refusal_dirs = {key: v['harmless_mean'] - v['harmful_mean'] for key, v in refusal_dirs.items()}
         else:
             refusal_dirs = {key: v['harmful_mean'] - v['harmless_mean'] for key, v in refusal_dirs.items()}
 
-        return {key: (v / v.norm()).to('cpu') for key, v in refusal_dirs.items()}
+        # The '.0.' name-based exclusion above only catches block-indexed layer-0 keys
+        # (e.g. 'blocks.0.hook_resid_pre'); other pre-transformer-block activations like
+        # 'hook_embed'/'hook_pos_embed' are just as prone to the same degenerate (zero or
+        # near-zero) norm that caused the layer-0 exclusion in the first place, but don't
+        # match that pattern. Checking the norm directly catches those too, instead of
+        # silently handing out a NaN/Inf "direction" that then propagates into anything
+        # that applies it (test_dir, apply_refusal_dirs, ...).
+        result = {}
+        for key, v in refusal_dirs.items():
+            norm = v.norm()
+            if not torch.isfinite(norm) or norm == 0:
+                logger.warning(f"Skipping '{key}': degenerate (zero/NaN/Inf) direction norm")
+                continue
+            result[key] = (v / norm).to('cpu')
+        return result
 
     def scored_dirs(self,invert = False) -> List[Tuple[str,Float[Tensor, 'd_model']]]:
         refusals = self.refusal_dirs(invert=invert)
-        return sorted([(ln,refusals[act_name]) for ln,act_name in self.get_all_act_names()],reverse=True, key=lambda x:abs(x[1].mean()))
+        # refusal_dirs() deliberately excludes layer 0 (NaN risk), but get_all_act_names()
+        # includes it by default (whitelisted unless explicitly blacklisted) -- skip any
+        # act_name refusal_dirs() left out instead of KeyError-ing on it.
+        return sorted(
+            [(ln,refusals[act_name]) for ln,act_name in self.get_all_act_names() if act_name in refusals],
+            reverse=True,
+            key=lambda x:abs(x[1].mean())
+        )
 
-    def get_layer_of_act_name(self, ref: str) -> str|int:
+    def get_layer_of_act_name(self, ref: str) -> Optional[int]:
         s = re.search(r"\.(\d+)\.",ref)
-        return s if s is None else int(s[1])
+        return None if s is None else int(s[1])
 
     def layer_attn(self, layer: int, replacement: Float[Tensor, "d_model"] = None) -> Float[Tensor, "d_model"]:
         if replacement is not None and layer not in self._blacklisted:
             # make sure device doesn't change
             self.modified = True
             self.model.blocks[layer].attn.W_O.data = replacement.to(self.model.blocks[layer].attn.W_O.device)
-            self.modified_layers['W_O'][layer] = self.modified_layers.get(layer,[])+[(self.model.blocks[layer].attn.W_O.data.to('cpu'),replacement.to('cpu'))]
+            self.modified_layers['W_O'][layer] = self.modified_layers['W_O'].get(layer,[])+[(self.model.blocks[layer].attn.W_O.data.to('cpu'),replacement.to('cpu'))]
         return self.model.blocks[layer].attn.W_O.data
 
     def layer_mlp(self, layer: int, replacement: Float[Tensor, "d_model"] = None) -> Float[Tensor, "d_model"]:
@@ -550,7 +581,7 @@ class ModelAbliterator:
             # make sure device doesn't change
             self.modified = True
             self.model.blocks[layer].mlp.W_out.data = replacement.to(self.model.blocks[layer].mlp.W_out.device)
-            self.modified_layers['mlp'][layer] = self.modified_layers.get(layer,[])+[(self.model.blocks[layer].mlp.W_out.data.to('cpu'),replacement.to('cpu'))]
+            self.modified_layers['mlp'][layer] = self.modified_layers['mlp'].get(layer,[])+[(self.model.blocks[layer].mlp.W_out.data.to('cpu'),replacement.to('cpu'))]
         return self.model.blocks[layer].mlp.W_out.data
 
     def tokenize_instructions_fn(
@@ -769,9 +800,10 @@ class ModelAbliterator:
         dirs = self.refusal_dirs(invert=invert)
         if self.modified:
             logger.warning("Model is modified; will restore to current modified state each run")
+        score_key = 'positive' if positive else 'negative'
         scores = []
         for direction in tqdm(dirs.items()):
-            score = self.test_dir(direction[1],N=N,use_hooks=use_hooks)[int(positive)]
+            score = self.test_dir(direction[1],N=N,use_hooks=use_hooks)[score_key]
             scores.append((score,direction))
         return sorted(scores,key=lambda x:x[0])
 
@@ -824,6 +856,16 @@ class ModelAbliterator:
             raise TypeError("Caches are not initialized. Run cache_activations first.")
         if not any("resid" in k for k in self.harmless.keys()):
             raise AssertionError("You need residual streams to decompose layers! Run cache_activations with 'resid_pre' or 'resid_post' in `activation_layers`")
+        # decompose_resid/accumulated_resid(apply_ln=True) also needs the final layernorm's
+        # scale cached -- the resid check above doesn't catch this on its own, and without it
+        # TransformerLens fails deep inside apply_ln_to_stack with a much less clear KeyError.
+        ln_scale_key = 'ln_final.hook_scale'
+        if ln_scale_key not in self.harmful.keys() or ln_scale_key not in self.harmless.keys():
+            raise AssertionError(
+                f"'{ln_scale_key}' is not in the cache, which apply_ln needs here. Run "
+                f"cache_activations with activation_layers=None (caches every activation type) "
+                f"rather than a restricted list."
+            )
 
         resid_harmful, labels = getattr(self.harmful, fn_name)(apply_ln=True, return_labels=True)
         resid_harmless = getattr(self.harmless, fn_name)(apply_ln=True)
@@ -853,7 +895,6 @@ class ModelAbliterator:
 
         decomposed_resid_harmful, decomposed_resid_harmless, labels = decomposer()
 
-        W_U = self.model.W_U.to('cpu')
         unembedded_harmful = self.unembed_resid(decomposed_resid_harmful)
         unembedded_harmless = self.unembed_resid(decomposed_resid_harmless)
 
@@ -863,7 +904,8 @@ class ModelAbliterator:
         harmful_set = torch.isin(sorted_harmful_indices, torch.tensor(list(token_set)))
         harmless_set = torch.isin(sorted_harmless_indices, torch.tensor(list(token_set if token_set_b is None else token_set_b)))
 
-        indices_in_set = zip(harmful_set.nonzero(as_tuple=True)[1],harmless_set.nonzero(as_tuple=True)[1])
+        # list(...): the type hint promises List[Tuple[int,int]], not a single-use zip iterator
+        indices_in_set = list(zip(harmful_set.nonzero(as_tuple=True)[1],harmless_set.nonzero(as_tuple=True)[1]))
         return indices_in_set
 
     def mse_positive(
@@ -906,18 +948,38 @@ class ModelAbliterator:
         batch_size: int = 8,
         last_indices: int = 1,
         measure_refusal: int = 0,
-        stop_at_layer: int = None
+        stop_at_layer: int = None,
+        activation_layers: List[str] = -1
     ) -> Tuple[ActivationCache, List[str]]:
         # Base functionality for creating an activation cache with a training set, prefer 'cache_activations' for regular usage
+        #
+        # NOTE: -1 (not None!) is the "not specified, use self.activation_layers" sentinel
+        # here, matching cache_activations' own convention. None is a meaningful value in
+        # its own right below (cache every activation type, no filter at all) -- conflating
+        # "not specified" with "explicitly None" would silently turn a caller's explicit
+        # activation_layers=None (cache everything) into the restricted instance default.
+        if activation_layers == -1:
+            activation_layers = self.activation_layers
+
+        # run_with_cache() builds its OWN names_filter from self.activation_layers (the
+        # instance attribute) whenever none is given, independent of the activation_layers
+        # resolved above -- so without passing an explicit names_filter here, a caller's
+        # activation_layers override would only ever narrow what's already hooked by the
+        # instance default, never widen it (e.g. activation_layers=None, meaning "cache
+        # everything", would still never see anything the instance default doesn't hook).
+        if activation_layers is None:
+            names_filter = lambda namefunc: True
+        else:
+            names_filter = lambda namefunc: any(s in namefunc for s in activation_layers)
 
         base = dict()
         z_label = [] if measure_refusal > 1 else None
         for i in tqdm(range(0,min(N,len(toks)),batch_size)):
-            logits,cache = self.run_with_cache(toks[i:min(i+batch_size,len(toks))],max_new_tokens=measure_refusal,stop_at_layer=stop_at_layer)
+            logits,cache = self.run_with_cache(toks[i:min(i+batch_size,len(toks))],names_filter=names_filter,max_new_tokens=measure_refusal,stop_at_layer=stop_at_layer)
             if measure_refusal > 1:
                 z_label.extend(self.measure_scores_from_logits(logits,measure_refusal)[0])
             for key in cache:
-                if self.activation_layers is None or any(k in key for k in self.activation_layers):
+                if activation_layers is None or any(k in key for k in activation_layers):
                     tensor = torch.mean(cache[key][:,-last_indices:,:].to('cpu'),dim=1)
                     if key not in base:
                         base[key] = tensor
@@ -968,7 +1030,7 @@ class ModelAbliterator:
 
         last_indices = last_indices or 1
 
-        self.harmful,self.harmful_z_label = self.create_activation_cache(harmful_toks,N=N,batch_size=batch_size,last_indices=last_indices,measure_refusal=measure_refusal,stop_at_layer=None)
+        self.harmful,self.harmful_z_label = self.create_activation_cache(harmful_toks,N=N,batch_size=batch_size,last_indices=last_indices,measure_refusal=measure_refusal,stop_at_layer=stop_at_layer,activation_layers=activation_layers)
         if not preserve_harmless:
-            self.harmless, self.harmless_z_label = self.create_activation_cache(harmless_toks,N=N,batch_size=batch_size,last_indices=last_indices,measure_refusal=measure_refusal,stop_at_layer=None)
+            self.harmless, self.harmless_z_label = self.create_activation_cache(harmless_toks,N=N,batch_size=batch_size,last_indices=last_indices,measure_refusal=measure_refusal,stop_at_layer=stop_at_layer,activation_layers=activation_layers)
 
