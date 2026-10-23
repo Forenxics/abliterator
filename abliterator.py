@@ -38,7 +38,6 @@ from torch import Tensor
 from tqdm import tqdm
 from transformer_lens import HookedTransformer, utils, ActivationCache
 from transformer_lens.hook_points import HookPoint
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
