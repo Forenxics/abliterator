@@ -735,7 +735,11 @@ class ModelAbliterator:
     ):
         """Induce a refusal direction into model weights.
 
-        Note: This method is incomplete and needs further work.
+        The mirror image of apply_refusal_dirs: instead of zeroing out the
+        component of the weights along refusal_dir (ablation), this replaces
+        it with the typical harmful-activation projection onto that
+        direction -- pushing the model toward exhibiting the harmful-like
+        activation pattern along this axis, rather than removing it.
 
         Args:
             refusal_dir: Direction tensor to induce.
@@ -752,7 +756,8 @@ class ModelAbliterator:
                     if refusal_dir.device != matrix.device:
                         refusal_dir = refusal_dir.to(matrix.device)
                     proj = einops.einsum(matrix, refusal_dir.view(-1, 1), '... d_model, d_model single -> ... single') * refusal_dir
-                    avg_proj = refusal_dir * self.get_avg_projections(utils.get_act_name(self.activation_layers[0], layer), refusal_dir)
+                    harmful_proj, _harmless_proj = self.get_avg_projections(utils.get_act_name(self.activation_layers[0], layer), refusal_dir)
+                    avg_proj = refusal_dir * harmful_proj
                     modifying[1](layer, (matrix - proj) + avg_proj)
 
     def test_dir(
@@ -878,6 +883,17 @@ class ModelAbliterator:
         return self.do_resid("accumulated_resid")
 
     def unembed_resid(self, resid: Float[Tensor, "layer batch d_model"], pos: int = -1) -> Float[Tensor, "layer batch d_vocab"]:
+        """Unembed a decomposed/accumulated residual stream into vocab logits.
+
+        Note: `pos` indexes resid's second axis directly (`resid[:, pos, :]`),
+        whatever that axis actually is. cache_activations() already collapses
+        the sequence position to the last `last_indices` tokens (averaged)
+        before caching, so when `resid` comes from decomposed_resid()/
+        accumulated_resid() on that cache, this axis is the cached *batch* of
+        examples, not a sequence position -- `pos=-1` (the default) selects
+        the last cached example only, not "the last token". Pass `pos=None`
+        to keep every example (shape `(layer, batch, d_vocab)`) instead.
+        """
         W_U = self.model.W_U
         if pos is None:
             return einops.einsum(resid.to(W_U.device), W_U, "layer batch d_model, d_model d_vocab -> layer batch d_vocab").to('cpu')
@@ -889,23 +905,64 @@ class ModelAbliterator:
         token_set: List[int]|Set[int]|Int[Tensor, '...'],
         decompose: bool = True,
         token_set_b: List[int]|Set[int]|Int[Tensor, '...'] = None
-    ) -> List[Tuple[int,int]]:
+    ) -> List[Tuple[str,int,int]]:
+        """Rank where each token in token_set falls in the unembedded logit
+        order, per residual-stream component, comparing harmful vs harmless.
+
+        For every (component, token) pair, reports the token's rank (0 =
+        highest logit) in the harmful-side unembedding vs. the harmless-side
+        unembedding of that component. By default (token_set_b=None) the
+        same tokens are ranked on both sides, directly comparing "how highly
+        does this token rank under harmful prompts vs. under harmless ones,
+        at this component". Pass token_set_b to instead compare a different
+        set of tokens on the harmless side (token_set and token_set_b are
+        then paired up positionally, so should be the same length).
+
+        Args:
+            token_set: Token IDs to rank on the harmful side (and the
+                harmless side too, unless token_set_b is given).
+            decompose: If True, use decomposed_resid (each component's direct
+                contribution); if False, use accumulated_resid (cumulative
+                up to each component).
+            token_set_b: Optional separate token IDs to rank on the harmless
+                side, paired positionally with token_set.
+
+        Returns:
+            List of (component_label, harmful_rank, harmless_rank) tuples,
+            one per (component, token) pair, ranks averaged over every
+            cached example.
+        """
         decomposer = self.decomposed_resid if decompose else self.accumulated_resid
 
         decomposed_resid_harmful, decomposed_resid_harmless, labels = decomposer()
 
-        unembedded_harmful = self.unembed_resid(decomposed_resid_harmful)
-        unembedded_harmless = self.unembed_resid(decomposed_resid_harmless)
+        # pos=None keeps every cached example (shape (component, batch,
+        # d_vocab)) rather than unembed_resid's pos=-1 default, which would
+        # silently keep only the last cached example. Averaging over the
+        # batch afterwards matches how the rest of this class (e.g.
+        # calculate_mean_dirs) treats cached activations.
+        unembedded_harmful = self.unembed_resid(decomposed_resid_harmful, pos=None).mean(dim=1)
+        unembedded_harmless = self.unembed_resid(decomposed_resid_harmless, pos=None).mean(dim=1)
 
-        sorted_harmful_indices = torch.argsort(unembedded_harmful, dim=1, descending=True)
-        sorted_harmless_indices = torch.argsort(unembedded_harmless, dim=1, descending=True)
+        # Rank-by-token-id: ranks[component, token_id] = how many tokens score
+        # higher than token_id at that component (0 = top). This is the
+        # inverse permutation of argsort, and lets us look up a specific
+        # token's rank directly instead of searching for it in sorted order.
+        harmful_ranks = torch.argsort(torch.argsort(unembedded_harmful, dim=-1, descending=True), dim=-1)
+        harmless_ranks = torch.argsort(torch.argsort(unembedded_harmless, dim=-1, descending=True), dim=-1)
 
-        harmful_set = torch.isin(sorted_harmful_indices, torch.tensor(list(token_set)))
-        harmless_set = torch.isin(sorted_harmless_indices, torch.tensor(list(token_set if token_set_b is None else token_set_b)))
+        harmful_tokens = list(token_set)
+        harmless_tokens = list(token_set if token_set_b is None else token_set_b)
 
-        # list(...): the type hint promises List[Tuple[int,int]], not a single-use zip iterator
-        indices_in_set = list(zip(harmful_set.nonzero(as_tuple=True)[1],harmless_set.nonzero(as_tuple=True)[1]))
-        return indices_in_set
+        rankings = []
+        for component_idx, label in enumerate(labels):
+            for h_tok, hl_tok in zip(harmful_tokens, harmless_tokens):
+                rankings.append((
+                    label,
+                    int(harmful_ranks[component_idx, h_tok]),
+                    int(harmless_ranks[component_idx, hl_tok]),
+                ))
+        return rankings
 
     def mse_positive(
         self,
