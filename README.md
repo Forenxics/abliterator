@@ -151,6 +151,12 @@ with my_model:
     print(my_model.test_dir(my_amazing_dir, N=32)) # ...weighed against the refusal scores
 ```
 
+To run that comparison end to end on a local model — baseline vs. plain, projected, norm-preserving and both, with refusal rate, token scores and KL per variant — use [`examples/compare_ablations.py`](examples/compare_ablations.py):
+```bash
+python examples/compare_ablations.py /path/to/local/model --official-name Qwen/Qwen2.5-0.5B-Instruct --chat-template chatml --out compare.json
+```
+It derives the refusal/compliance score tokens from the model's own tokenizer, applies every variant inside a context manager (nothing is written to your model), and prints a table plus sample completions.
+
 ### Blacklisting specific layers
 Sometimes some layers are troublesome no matter what you do. If you're worried about accidentally replacing it, you can blacklist it to prevent any alteration from occurring:
 ```python
