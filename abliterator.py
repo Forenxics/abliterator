@@ -23,7 +23,7 @@ from typing import (
     Callable,
     Dict,
     Generator,
-    Iterator,
+    Iterable,
     List,
     Optional,
     Set,
@@ -47,7 +47,18 @@ TokenSet = Union[List[int], Tuple[int, ...], Set[int], Int[Tensor, '...']]
 InstructionList = List[str]
 DatasetSplit = Tuple[InstructionList, InstructionList]
 
-def batch(iterable: Iterator, n: int) -> Generator[List, None, None]:
+# Activation types cached and hooked by default: all per-position d_model vectors.
+DEFAULT_ACTIVATION_LAYERS = ['resid_pre', 'resid_post', 'mlp_out', 'attn_out']
+
+# What decomposed_resid()/accumulated_resid() need in the cache. Narrower than
+# activation_layers=None (everything), which also stores attention patterns.
+RESID_DECOMPOSITION_LAYERS = [
+    'hook_embed', 'hook_pos_embed', 'attn_out', 'mlp_out', 'resid_pre', 'resid_post', 'ln_final.hook_scale'
+]
+
+CACHE_FORMAT_VERSION = 2
+
+def batch(iterable: Iterable, n: int) -> Generator[List, None, None]:
     """Yield successive n-sized chunks from an iterable.
 
     Args:
@@ -111,20 +122,18 @@ def prepare_dataset(dataset: Tuple[List[str], List[str]] | List[str]) -> Tuple[L
     Returns:
         Tuple of (train_list, test_list)
     """
-    # Check if dataset is already split into a (train, test) tuple. Per the
-    # documented type contract, the flat/unsplit form is always a List, never
-    # a tuple, so checking for a 2-tuple of lists is sufficient and (unlike a
-    # non-empty/content check) doesn't misclassify a presplit dataset that
-    # happens to have an empty train or test list.
+    # A flat dataset is a sequence of strings, so two list/tuple elements can only
+    # be a (train, test) pair -- whether the pair itself is a tuple or a list (e.g.
+    # loaded from JSON). No content check, so an empty train or test list is fine.
     is_presplit = (
-        isinstance(dataset, tuple) and
+        isinstance(dataset, (tuple, list)) and
         len(dataset) == 2 and
-        isinstance(dataset[0], list) and
-        isinstance(dataset[1], list)
+        isinstance(dataset[0], (list, tuple)) and
+        isinstance(dataset[1], (list, tuple))
     )
 
     if is_presplit:
-        train, test = dataset
+        train, test = list(dataset[0]), list(dataset[1])
     else:
         train, test = train_test_split(list(dataset), test_size=0.1, random_state=42)
 
@@ -147,8 +156,7 @@ def directional_hook(
     Returns:
         The modified activation with the directional component removed.
     """
-    if activation.device != direction.device:
-        direction = direction.to(activation.device)
+    direction = direction.to(activation.device, activation.dtype)
 
     proj = einops.einsum(activation, direction.view(-1, 1), '... d_model, d_model single -> ... single') * direction
     return activation - proj
@@ -272,18 +280,19 @@ class ModelAbliterator:
 
     def __init__(
         self,
-        model: str,
+        model: Union[str, HookedTransformer],
         dataset: Union[Tuple[DatasetSplit, DatasetSplit], List[DatasetSplit]],
         device: str = 'cuda',
         n_devices: Optional[int] = None,
         cache_fname: Optional[str] = None,
-        activation_layers: List[str] = ['resid_pre', 'resid_post', 'mlp_out', 'attn_out'],
+        activation_layers: Optional[List[str]] = DEFAULT_ACTIVATION_LAYERS,
         chat_template: Optional[str] = None,
         positive_toks: Optional[TokenSet] = None,
         negative_toks: Optional[TokenSet] = None,
         hf_model: Optional[Any] = None,
         tokenizer: Optional[Any] = None,
-        dtype: torch.dtype = torch.bfloat16
+        dtype: torch.dtype = torch.bfloat16,
+        allow_unsafe_cache: bool = False
     ):
         """Initialize the ModelAbliterator.
 
@@ -292,12 +301,17 @@ class ModelAbliterator:
                 TransformerLens architecture/config to build (e.g. "gpt2",
                 "meta-llama/Meta-Llama-3-8B-Instruct"). If `hf_model` is not
                 given, weights are also downloaded from this name/path.
+                Alternatively an already-built HookedTransformer (with a
+                tokenizer), used as-is; device/n_devices/hf_model/tokenizer/
+                dtype are then ignored.
             dataset: Tuple of (harmful_dataset, harmless_dataset), where each dataset
                 is either a pre-split (train, test) tuple or a list to be split.
             device: Device to load the model on ('cuda' or 'cpu').
             n_devices: Number of devices for model parallelism. Defaults to available GPUs.
             cache_fname: Path to a cached activations file to load.
             activation_layers: List of activation types to cache (e.g., 'resid_pre', 'mlp_out').
+                None caches every activation type; hooks and direction lookups
+                then fall back to DEFAULT_ACTIVATION_LAYERS.
             chat_template: Custom chat template string with {instruction} placeholder.
             positive_toks: Token IDs indicating positive/compliant responses.
             negative_toks: Token IDs indicating negative/refusal responses.
@@ -311,25 +325,32 @@ class ModelAbliterator:
             dtype: Torch dtype to load the model in. Defaults to bfloat16;
                 use float32 (or float16) on hardware/backends without good
                 bfloat16 support, e.g. most CPUs.
+            allow_unsafe_cache: Cache files written before format 2 hold pickled
+                objects, and loading them can run arbitrary code. They are refused
+                unless this is True; only set it for files you created yourself.
         """
-        self.MODEL_PATH = model
-        if n_devices is None and torch.cuda.is_available():
-            n_devices = torch.cuda.device_count()
-        elif n_devices is None:
-            n_devices = 1
-
         # Save memory
         torch.set_grad_enabled(False)
 
-        self.model = HookedTransformer.from_pretrained_no_processing(
-            model,
-            hf_model=hf_model,
-            tokenizer=tokenizer,
-            n_devices=n_devices,
-            device=device,
-            dtype=dtype,
-            default_padding_side='left'
-        )
+        if isinstance(model, HookedTransformer):
+            self.MODEL_PATH = model.cfg.model_name
+            self.model = model
+        else:
+            self.MODEL_PATH = model
+            if n_devices is None and torch.cuda.is_available():
+                n_devices = torch.cuda.device_count()
+            elif n_devices is None:
+                n_devices = 1
+
+            self.model = HookedTransformer.from_pretrained_no_processing(
+                model,
+                hf_model=hf_model,
+                tokenizer=tokenizer,
+                n_devices=n_devices,
+                device=device,
+                dtype=dtype,
+                default_padding_side='left'
+            )
 
         self.model.requires_grad_(False)
 
@@ -343,26 +364,18 @@ class ModelAbliterator:
         self.harmless = {}
         self.modified_layers = {'mlp':{}, 'W_O':{}}
         self.checkpoints = []
+        self.modified = False
 
         if cache_fname is not None:
-            # Note: weights_only=False is required for loading ActivationCache objects.
-            # Only load cache files from trusted sources.
-            try:
-                outs = torch.load(cache_fname, map_location='cpu', weights_only=False)
-                if not isinstance(outs, (list, tuple)) or len(outs) < 4:
-                    raise ValueError(f"Invalid cache file format: expected list with at least 4 elements, got {type(outs)}")
-                self.harmful, self.harmless, modified_layers, checkpoints = outs[:4]
-                self.checkpoints = checkpoints or []
-                self.modified_layers = modified_layers or {'mlp': {}, 'W_O': {}}
-            except Exception as e:
-                raise RuntimeError(f"Failed to load cache from '{cache_fname}': {e}") from e
+            self._load_cache(cache_fname, allow_unsafe_cache)
 
         self.harmful_inst_train,self.harmful_inst_test = prepare_dataset(dataset[0])
         self.harmless_inst_train,self.harmless_inst_test = prepare_dataset(dataset[1])
 
         self.fwd_hooks = []
-        self.modified = False
-        self.activation_layers = [activation_layers] if isinstance(activation_layers, str) else activation_layers
+        if isinstance(activation_layers, str):
+            activation_layers = [activation_layers]
+        self.activation_layers = None if activation_layers is None else list(activation_layers)
         if negative_toks is None:
             logger.warning("'negative_toks' not set, defaulting to tokens for Llama-3 vocab")
             self.negative_toks = {4250, 14931, 89735, 20451, 11660, 11458, 956}  # llama-3 refusal tokens e.g. ' cannot', ' unethical', ' sorry'
@@ -380,7 +393,7 @@ class ModelAbliterator:
         if hasattr(self, "current_state"):
             raise RuntimeError("Cannot nest context managers (multi-contexting not supported)")
         self.current_state = self.model.state_dict()
-        self.current_layers = self.modified_layers.copy()
+        self.current_layers = self._copy_modified_layers()
         self.was_modified = self.modified
         return self
 
@@ -402,7 +415,57 @@ class ModelAbliterator:
     def checkpoint(self) -> None:
         """Save the current modification state to the checkpoint list."""
         # TODO: Consider offloading to disk to save RAM
-        self.checkpoints.append(self.modified_layers.copy())
+        self.checkpoints.append(self._copy_modified_layers())
+
+    def _copy_modified_layers(self) -> Dict[str, Dict[int, list]]:
+        # dict.copy() alone would share the inner per-kind dicts, which layer_attn/
+        # layer_mlp write into -- a snapshot would then keep changing after it was taken.
+        return {kind: dict(layers) for kind, layers in self.modified_layers.items()}
+
+    @property
+    def _hook_layers(self) -> List[str]:
+        # activation_layers=None means "cache everything", which is not a usable
+        # list of hook points or direction keys.
+        return self.activation_layers if self.activation_layers else DEFAULT_ACTIVATION_LAYERS
+
+    def _load_cache(self, fname: str, allow_unsafe: bool) -> None:
+        try:
+            outs = torch.load(fname, map_location='cpu', weights_only=True)
+        except Exception as e:
+            if not allow_unsafe:
+                raise RuntimeError(
+                    f"Could not load '{fname}' as a format-{CACHE_FORMAT_VERSION} cache ({e}). If it was written by "
+                    f"an older version it contains pickled objects, and loading it can run arbitrary code: "
+                    f"pass allow_unsafe_cache=True only if you created the file yourself."
+                ) from e
+            outs = torch.load(fname, map_location='cpu', weights_only=False)
+
+        if isinstance(outs, dict) and outs.get('format') == CACHE_FORMAT_VERSION:
+            harmful, harmless = outs['harmful'], outs['harmless']
+            modified_layers, checkpoints = outs['modified_layers'], outs['checkpoints']
+        elif isinstance(outs, (list, tuple)) and len(outs) >= 4:
+            harmful, harmless, modified_layers, checkpoints = outs[:4]
+        else:
+            raise RuntimeError(f"Failed to load cache from '{fname}': unrecognised format ({type(outs)})")
+
+        def as_cache(acts):
+            if isinstance(acts, ActivationCache) or not acts:
+                return acts or {}
+            return ActivationCache(dict(acts), self.model)
+
+        self.harmful, self.harmless = as_cache(harmful), as_cache(harmless)
+        self.checkpoints = checkpoints or []
+        self.modified_layers = modified_layers or {'mlp': {}, 'W_O': {}}
+
+        # Re-apply the saved weight edits: the last recorded replacement per layer.
+        for layer, history in self.modified_layers['W_O'].items():
+            W_O = self.model.blocks[layer].attn.W_O
+            W_O.data = history[-1][1].to(W_O.device, W_O.dtype)
+            self.modified = True
+        for layer, history in self.modified_layers['mlp'].items():
+            W_out = self.model.blocks[layer].mlp.W_out
+            W_out.data = history[-1][1].to(W_out.device, W_out.dtype)
+            self.modified = True
 
     # Utility functions
 
@@ -423,13 +486,28 @@ class ModelAbliterator:
             self._blacklisted.discard(layer)
 
     def save_activations(self, fname: str):
-        torch.save([self.harmful,self.harmless,self.modified_layers if self.modified_layers['mlp'] or self.modified_layers['W_O'] else None, self.checkpoints if len(self.checkpoints) > 0 else None], fname)
+        """Save cached activations, recorded weight edits and checkpoints.
+
+        Written as plain tensors and containers so it loads with
+        torch.load(weights_only=True). Load it back with cache_fname=...,
+        which also re-applies the recorded weight edits to the model.
+        """
+        def as_dict(acts):
+            return dict(acts.cache_dict) if isinstance(acts, ActivationCache) else dict(acts)
+
+        torch.save({
+            'format': CACHE_FORMAT_VERSION,
+            'harmful': as_dict(self.harmful),
+            'harmless': as_dict(self.harmless),
+            'modified_layers': self.modified_layers,
+            'checkpoints': self.checkpoints,
+        }, fname)
 
     def get_whitelisted_layers(self) -> List[int]:
         return [l for l in range(self.model.cfg.n_layers) if l not in self._blacklisted]
 
     def get_all_act_names(self, activation_layers: List[str] = None) -> List[Tuple[int,str]]:
-        return [(i,utils.get_act_name(act_name,i)) for i in self.get_whitelisted_layers() for act_name in (activation_layers or self.activation_layers)]
+        return [(i,utils.get_act_name(act_name,i)) for i in self.get_whitelisted_layers() for act_name in (activation_layers or self._hook_layers)]
 
     def calculate_mean_dirs(self, key: str, include_overall_mean: bool = False) -> Dict[str, Float[Tensor, 'd_model']]:
         """Calculate mean activation directions for harmful and harmless sets.
@@ -441,19 +519,23 @@ class ModelAbliterator:
         Returns:
             Dict with 'harmful_mean', 'harmless_mean', and optionally 'mean_dir'.
         """
+        # Activations are cached in the model's dtype (bfloat16 by default, ~3
+        # significant digits). Averaging and subtracting in that precision visibly
+        # perturbs the resulting direction, so do the arithmetic in float32.
+        harmful, harmless = self.harmful[key].float(), self.harmless[key].float()
         dirs = {
-            'harmful_mean': torch.mean(self.harmful[key], dim=0),
-            'harmless_mean': torch.mean(self.harmless[key], dim=0)
+            'harmful_mean': torch.mean(harmful, dim=0),
+            'harmless_mean': torch.mean(harmless, dim=0)
         }
 
         if include_overall_mean:
-            if self.harmful[key].shape != self.harmless[key].shape or self.harmful[key].device.type == 'cuda':
+            if harmful.shape != harmless.shape or harmful.device.type == 'cuda':
                 # If the shapes are different, we can't add them together; we'll need to concatenate the tensors first.
                 # Using 'cpu', this is slower than the alternative below.
                 # Using 'cuda', this seems to be faster than the alternatives.
                 # NOTE: Assume both tensors are on the same device.
                 #
-                dirs['mean_dir'] = torch.mean(torch.cat((self.harmful[key], self.harmless[key]), dim=0), dim=0)
+                dirs['mean_dir'] = torch.mean(torch.cat((harmful, harmless), dim=0), dim=0)
             else:
                 # If the shapes are the same, we can add them together, take the mean,
                 # then divide by 2.0 to account for the initial element-wise addition of the tensors.
@@ -461,7 +543,7 @@ class ModelAbliterator:
                 # The result is identical to:
                 #    `torch.sum(self.harmful[key] + self.harmless[key]) / (len(self.harmful[key]) + len(self.harmless[key]))`
                 #
-                dirs['mean_dir'] =  torch.mean(self.harmful[key] + self.harmless[key], dim=0) / 2.0
+                dirs['mean_dir'] =  torch.mean(harmful + harmless, dim=0) / 2.0
 
         return dirs
 
@@ -476,6 +558,7 @@ class ModelAbliterator:
             Tuple of (harmful_projection, harmless_projection).
         """
         dirs = self.calculate_mean_dirs(key)
+        direction = direction.to(dirs['harmful_mean'].device, dirs['harmful_mean'].dtype)
         return (torch.dot(dirs['harmful_mean'], direction), torch.dot(dirs['harmless_mean'], direction))
 
     def get_layer_dirs(self, layer: int, key: Optional[str] = None, include_overall_mean: bool = False) -> Dict[str, Float[Tensor, 'd_model']]:
@@ -493,7 +576,7 @@ class ModelAbliterator:
             IndexError: If layer is out of range.
             KeyError: If activation not found in cache.
         """
-        act_key = key or self.activation_layers[0]
+        act_key = key or self._hook_layers[0]
         if layer < 0 or layer >= self.model.cfg.n_layers:
             raise IndexError(f"Invalid layer {layer}. Must be in range [0, {self.model.cfg.n_layers})")
         act_name = utils.get_act_name(act_key, layer)
@@ -501,7 +584,7 @@ class ModelAbliterator:
             raise KeyError(f"Activation '{act_name}' not found in cache. Run cache_activations first.")
         return self.calculate_mean_dirs(act_name, include_overall_mean=include_overall_mean)
 
-    def refusal_dirs(self, invert: bool = False) -> Dict[str, Float[Tensor, 'd_model']]:
+    def refusal_dirs(self, invert: bool = False, projected: bool = False) -> Dict[str, Float[Tensor, 'd_model']]:
         """Compute normalized refusal directions for all cached activations.
 
         The refusal direction is the difference between harmful and harmless mean
@@ -509,6 +592,9 @@ class ModelAbliterator:
 
         Args:
             invert: If True, compute harmless - harmful instead of harmful - harmless.
+            projected: If True, remove the component of each direction that lies
+                along the mean harmless activation before normalizing ("projected
+                abliteration"), so ablating it disturbs harmless behaviour less.
 
         Returns:
             Dict mapping activation names to normalized refusal direction tensors.
@@ -526,15 +612,32 @@ class ModelAbliterator:
         # ln_final.hook_scale or attention patterns, which aren't valid ablation
         # directions at all -- applying one via test_dir/apply_refusal_dirs would
         # crash on a shape mismatch rather than silently doing something meaningless.
+        # preserve_harmless can leave the two caches with different keys (harmful
+        # re-cached with other activation_layers); only keys in both are usable.
+        harmless_keys = set(self.harmless.keys())
+        missing = [key for key in self.harmful.keys() if key not in harmless_keys]
+        if missing:
+            logger.warning(
+                f"{len(missing)} cached harmful activations have no harmless counterpart and are skipped "
+                f"(e.g. '{missing[0]}'); re-run cache_activations(preserve_harmless=False) to cache both."
+            )
         refusal_dirs = {
             key: self.calculate_mean_dirs(key)
-            for key in self.harmful
-            if '.0.' not in key and self.harmful[key].shape[-1] == self.hidden_size
+            for key in self.harmful.keys()
+            if key in harmless_keys and '.0.' not in key and self.harmful[key].shape[-1] == self.hidden_size
         }
+        harmless_means = {key: v['harmless_mean'] for key, v in refusal_dirs.items()}
         if invert:
             refusal_dirs = {key: v['harmless_mean'] - v['harmful_mean'] for key, v in refusal_dirs.items()}
         else:
             refusal_dirs = {key: v['harmful_mean'] - v['harmless_mean'] for key, v in refusal_dirs.items()}
+
+        if projected:
+            for key, v in refusal_dirs.items():
+                harmless_norm = harmless_means[key].norm()
+                if torch.isfinite(harmless_norm) and harmless_norm > 0:
+                    harmless_unit = harmless_means[key] / harmless_norm
+                    refusal_dirs[key] = v - torch.dot(v, harmless_unit) * harmless_unit
 
         # The '.0.' name-based exclusion above only catches block-indexed layer-0 keys
         # (e.g. 'blocks.0.hook_resid_pre'); other pre-transformer-block activations like
@@ -552,7 +655,7 @@ class ModelAbliterator:
             result[key] = (v / norm).to('cpu')
         return result
 
-    def scored_dirs(self,invert = False) -> List[Tuple[str,Float[Tensor, 'd_model']]]:
+    def scored_dirs(self,invert = False) -> List[Tuple[int,Float[Tensor, 'd_model']]]:
         refusals = self.refusal_dirs(invert=invert)
         # refusal_dirs() deliberately excludes layer 0 (NaN risk), but get_all_act_names()
         # includes it by default (whitelisted unless explicitly blacklisted) -- skip any
@@ -571,16 +674,20 @@ class ModelAbliterator:
         if replacement is not None and layer not in self._blacklisted:
             # make sure device doesn't change
             self.modified = True
+            previous = self.model.blocks[layer].attn.W_O.data.to('cpu')
+            replacement = replacement.to(previous.dtype)
             self.model.blocks[layer].attn.W_O.data = replacement.to(self.model.blocks[layer].attn.W_O.device)
-            self.modified_layers['W_O'][layer] = self.modified_layers['W_O'].get(layer,[])+[(self.model.blocks[layer].attn.W_O.data.to('cpu'),replacement.to('cpu'))]
+            self.modified_layers['W_O'][layer] = self.modified_layers['W_O'].get(layer,[])+[(previous,replacement.to('cpu'))]
         return self.model.blocks[layer].attn.W_O.data
 
     def layer_mlp(self, layer: int, replacement: Float[Tensor, "d_model"] = None) -> Float[Tensor, "d_model"]:
         if replacement is not None and layer not in self._blacklisted:
             # make sure device doesn't change
             self.modified = True
+            previous = self.model.blocks[layer].mlp.W_out.data.to('cpu')
+            replacement = replacement.to(previous.dtype)
             self.model.blocks[layer].mlp.W_out.data = replacement.to(self.model.blocks[layer].mlp.W_out.device)
-            self.modified_layers['mlp'][layer] = self.modified_layers['mlp'].get(layer,[])+[(self.model.blocks[layer].mlp.W_out.data.to('cpu'),replacement.to('cpu'))]
+            self.modified_layers['mlp'][layer] = self.modified_layers['mlp'].get(layer,[])+[(previous,replacement.to('cpu'))]
         return self.model.blocks[layer].mlp.W_out.data
 
     def tokenize_instructions_fn(
@@ -609,7 +716,11 @@ class ModelAbliterator:
         # fewer/reordered rows once any sequence finishes early, silently
         # breaking any caller that indexes it by original batch position.
         batch_size, prompt_len = toks.shape
-        all_toks = torch.zeros((batch_size, prompt_len + max_tokens_generated), dtype=torch.long, device=toks.device)
+        # Unwritten positions (rows that hit EOS, or everything after a refusal
+        # break) hold the pad token, so decoding with skip_special_tokens drops
+        # them; zeros would decode as whatever token 0 is ('!' for Llama-3).
+        pad_id = self.model.tokenizer.pad_token_id
+        all_toks = torch.full((batch_size, prompt_len + max_tokens_generated), 0 if pad_id is None else pad_id, dtype=torch.long, device=toks.device)
         all_toks[:, :prompt_len] = toks
         generating = set(range(batch_size))
         for i in range(max_tokens_generated):
@@ -667,10 +778,11 @@ class ModelAbliterator:
         remove_batch_dim: bool = False,
         reset_hooks_end: bool = True,
         clear_contexts: bool = False,
-        fwd_hooks: List[str] = [],
+        fwd_hooks: Optional[List[Tuple[str, Callable]]] = None,
         max_new_tokens: int = 1,
         **model_kwargs
     ) -> Tuple[Float[Tensor, 'batch_size seq_len d_vocab'], Dict[str, Float[Tensor, 'batch_size seq_len d_model']]]:
+        # incl_bwd is not usable: the constructor disables gradients globally.
         if names_filter is None and self.activation_layers:
             def activation_layering(namefunc: str):
                 return any(s in namefunc for s in self.activation_layers)
@@ -685,7 +797,7 @@ class ModelAbliterator:
             pos_slice=utils.Slice(None)
         )
 
-        fwd_hooks = fwd_hooks+fwd+self.fwd_hooks
+        fwd_hooks = (fwd_hooks or [])+fwd+self.fwd_hooks
 
         if not max_new_tokens:
             # must do at least 1 token
@@ -704,15 +816,22 @@ class ModelAbliterator:
         refusal_dirs: List[Float[Tensor, 'd_model']],
         W_O: bool = True,
         mlp: bool = True,
-        layers: List[int] = None
+        layers: List[int] = None,
+        preserve_norm: bool = False
     ):
         """Apply refusal directions to model weights.
 
         Args:
-            refusal_dirs: List of direction tensors to ablate from weights.
+            refusal_dirs: List of unit-norm direction tensors to ablate from
+                weights (refusal_dirs() returns them normalized; the projection
+                is wrong for a direction that is not unit length).
             W_O: Whether to modify attention output weights.
             mlp: Whether to modify MLP output weights.
             layers: List of layer indices to modify. Defaults to all layers except layer 0.
+            preserve_norm: If True, rescale every weight row back to its original
+                norm after removing the direction ("norm-preserving" ablation). The
+                rows stay orthogonal to the direction. Reported to help on some
+                models and hurt on others, so compare with kl_divergence().
         """
         if layers is None:
             layers = list(range(1, self.model.cfg.n_layers))
@@ -721,10 +840,14 @@ class ModelAbliterator:
                 for modifying in [(W_O, self.layer_attn), (mlp, self.layer_mlp)]:
                     if modifying[0]:
                         matrix = modifying[1](layer)
-                        if refusal_dir.device != matrix.device:
-                            refusal_dir = refusal_dir.to(matrix.device)
+                        refusal_dir = refusal_dir.to(matrix.device, matrix.dtype)
                         proj = einops.einsum(matrix, refusal_dir.view(-1, 1), '... d_model, d_model single -> ... single') * refusal_dir
-                        modifying[1](layer, matrix - proj)
+                        ablated = matrix - proj
+                        if preserve_norm:
+                            original_norms = matrix.float().norm(dim=-1, keepdim=True)
+                            ablated_norms = ablated.float().norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                            ablated = (ablated.float() * (original_norms / ablated_norms)).to(matrix.dtype)
+                        modifying[1](layer, ablated)
 
     def induce_refusal_dir(
         self,
@@ -733,13 +856,17 @@ class ModelAbliterator:
         mlp: bool = True,
         layers: List[int] = None
     ):
-        """Induce a refusal direction into model weights.
+        """Experimental: push model weights toward a refusal direction.
 
-        The mirror image of apply_refusal_dirs: instead of zeroing out the
-        component of the weights along refusal_dir (ablation), this replaces
-        it with the typical harmful-activation projection onto that
-        direction -- pushing the model toward exhibiting the harmful-like
-        activation pattern along this axis, rather than removing it.
+        For each selected W_O / MLP W_out matrix this removes the component
+        along refusal_dir and then adds `refusal_dir * p` to every row, where
+        p is the cached mean harmful activation's projection onto refusal_dir
+        at that layer. Each row's contribution is scaled by its neuron's
+        activation, so the resulting output along refusal_dir is
+        p * (sum of that layer's neuron activations): it grows with the
+        activations and is NOT pinned to p. Treat it as a rough steering
+        edit and check the outputs; a fixed offset would need a bias edit.
+        Needs cache_activations() to have been run.
 
         Args:
             refusal_dir: Direction tensor to induce.
@@ -747,17 +874,17 @@ class ModelAbliterator:
             mlp: Whether to modify MLP output weights.
             layers: List of layer indices to modify. Defaults to all layers except layer 0.
         """
+        logger.warning("induce_refusal_dir is experimental; see its docstring for what it actually changes")
         if layers is None:
             layers = list(range(1, self.model.cfg.n_layers))
         for layer in layers:
             for modifying in [(W_O, self.layer_attn), (mlp, self.layer_mlp)]:
                 if modifying[0]:
                     matrix = modifying[1](layer)
-                    if refusal_dir.device != matrix.device:
-                        refusal_dir = refusal_dir.to(matrix.device)
+                    refusal_dir = refusal_dir.to(matrix.device, matrix.dtype)
                     proj = einops.einsum(matrix, refusal_dir.view(-1, 1), '... d_model, d_model single -> ... single') * refusal_dir
-                    harmful_proj, _harmless_proj = self.get_avg_projections(utils.get_act_name(self.activation_layers[0], layer), refusal_dir)
-                    avg_proj = refusal_dir * harmful_proj
+                    harmful_proj, _harmless_proj = self.get_avg_projections(utils.get_act_name(self._hook_layers[0], layer), refusal_dir)
+                    avg_proj = refusal_dir * harmful_proj.to(matrix.device, matrix.dtype)
                     modifying[1](layer, (matrix - proj) + avg_proj)
 
     def test_dir(
@@ -765,9 +892,10 @@ class ModelAbliterator:
         refusal_dir: Float[Tensor, 'd_model'],
         activation_layers: List[str] = None,
         use_hooks: bool = True,
-        layers: List[str] = None,
+        layers: List[int] = None,
         **kwargs
-    ) -> Dict[str, Float[Tensor, 'd_model']]:
+    ) -> Dict[str, Tensor]:
+        # Returns {'negative': score, 'positive': score} from measure_scores().
         # `use_hooks=True` is better for bigger models as it causes a lot of memory swapping otherwise, but
         # `use_hooks=False` is much more representative of the final weights manipulation
 
@@ -777,7 +905,7 @@ class ModelAbliterator:
                 layers = self.get_whitelisted_layers()
 
             if activation_layers is None:
-                activation_layers = self.activation_layers
+                activation_layers = self._hook_layers
 
             if use_hooks:
                 hook_fn = functools.partial(directional_hook,direction=refusal_dir)
@@ -800,7 +928,9 @@ class ModelAbliterator:
         positive: bool = False,
         use_hooks: bool = True,
         invert: bool = False
-    ) -> List[Tuple[float,str]]:
+    ) -> List[Tuple[Tensor, Tuple[str, Tensor]]]:
+        # Returns [(score, (act_name, direction)), ...], best first: lowest
+        # negative score, or highest positive score when positive=True.
         dirs = self.refusal_dirs(invert=invert)
         if self.modified:
             logger.warning("Model is modified; will restore to current modified state each run")
@@ -809,7 +939,7 @@ class ModelAbliterator:
         for direction in tqdm(dirs.items()):
             score = self.test_dir(direction[1],N=N,use_hooks=use_hooks)[score_key]
             scores.append((score,direction))
-        return sorted(scores,key=lambda x:x[0])
+        return sorted(scores,key=lambda x:x[0],reverse=positive)
 
     def measure_scores(
         self,
@@ -818,7 +948,8 @@ class ModelAbliterator:
         measure: str = 'max',
         batch_measure: str = 'max',
         positive: bool = False
-    ) -> Dict[str, Float[Tensor, 'd_model']]:
+    ) -> Dict[str, Tensor]:
+        # `positive` is unused (both scores are always returned); kept for API compatibility.
         toks = self.tokenize_instructions_fn(instructions=self.harmful_inst_test[:N])
         logits,cache = self.run_with_cache(toks,max_new_tokens=sampled_token_ct,drop_refusals=False)
 
@@ -827,6 +958,33 @@ class ModelAbliterator:
         negative_score = measure_fn(measure,negative_score)
         positive_score = measure_fn(measure,positive_score)
         return {'negative':negative_score.to('cpu'), 'positive':positive_score.to('cpu')}
+
+    def harmless_logprobs(self, N: int = 32, batch_size: int = 8) -> Float[Tensor, 'batch_size d_vocab']:
+        """Next-token log-probabilities for the first N harmless test prompts.
+
+        Take this on the unmodified model as the baseline for kl_divergence().
+        """
+        prompts = self.harmless_inst_test[:N]
+        # Tokenize together so every batch is padded identically to the baseline run.
+        toks = self.tokenize_instructions_fn(prompts)
+        out = []
+        for i in range(0, len(toks), batch_size):
+            logits = self.model(toks[i:i + batch_size])
+            out.append(torch.log_softmax(logits[:, -1, :].float(), dim=-1).to('cpu'))
+        return torch.cat(out, dim=0)
+
+    def kl_divergence(self, baseline: Float[Tensor, 'batch_size d_vocab'], N: int = 32, batch_size: int = 8) -> float:
+        """KL(baseline || current model) of next-token distributions on harmless prompts.
+
+        `baseline` is harmless_logprobs() from the unmodified model with the same N.
+        0 means the edit left harmless behaviour unchanged at the first generated
+        token; larger means more collateral change. This is the usual damage metric
+        for comparing ablations, alongside the refusal score.
+        """
+        current = self.harmless_logprobs(N=N, batch_size=batch_size)
+        if current.shape != baseline.shape:
+            raise ValueError(f"baseline shape {tuple(baseline.shape)} != current {tuple(current.shape)}; use the same N")
+        return F.kl_div(current, baseline, reduction='batchmean', log_target=True).item()
 
     def measure_scores_from_logits(
         self,
@@ -859,7 +1017,7 @@ class ModelAbliterator:
         if not isinstance(self.harmful, ActivationCache) or not isinstance(self.harmless, ActivationCache):
             raise TypeError("Caches are not initialized. Run cache_activations first.")
         if not any("resid" in k for k in self.harmless.keys()):
-            raise AssertionError("You need residual streams to decompose layers! Run cache_activations with 'resid_pre' or 'resid_post' in `activation_layers`")
+            raise AssertionError("You need residual streams to decompose layers! Run cache_activations(activation_layers=RESID_DECOMPOSITION_LAYERS)")
         # decompose_resid/accumulated_resid(apply_ln=True) also needs the final layernorm's
         # scale cached -- the resid check above doesn't catch this on its own, and without it
         # TransformerLens fails deep inside apply_ln_to_stack with a much less clear KeyError.
@@ -867,8 +1025,7 @@ class ModelAbliterator:
         if ln_scale_key not in self.harmful.keys() or ln_scale_key not in self.harmless.keys():
             raise AssertionError(
                 f"'{ln_scale_key}' is not in the cache, which apply_ln needs here. Run "
-                f"cache_activations with activation_layers=None (caches every activation type) "
-                f"rather than a restricted list."
+                f"cache_activations(activation_layers=RESID_DECOMPOSITION_LAYERS, preserve_harmless=False)."
             )
 
         resid_harmful, labels = getattr(self.harmful, fn_name)(apply_ln=True, return_labels=True)
@@ -929,8 +1086,8 @@ class ModelAbliterator:
 
         Returns:
             List of (component_label, harmful_rank, harmless_rank) tuples,
-            one per (component, token) pair, ranks averaged over every
-            cached example.
+            one per (component, token) pair. Logits are averaged over every
+            cached example first, then ranked.
         """
         decomposer = self.decomposed_resid if decompose else self.accumulated_resid
 
@@ -953,6 +1110,11 @@ class ModelAbliterator:
 
         harmful_tokens = list(token_set)
         harmless_tokens = list(token_set if token_set_b is None else token_set_b)
+        if len(harmful_tokens) != len(harmless_tokens):
+            raise ValueError(
+                f"token_set ({len(harmful_tokens)} tokens) and token_set_b ({len(harmless_tokens)}) are paired "
+                f"positionally and must be the same length"
+            )
 
         rankings = []
         for component_idx, label in enumerate(labels):
@@ -986,7 +1148,7 @@ class ModelAbliterator:
         for i in tqdm(range(0,min(N,len(toks)),batch_size)):
             logits,cache = self.run_with_cache(toks[i:min(i+batch_size,len(toks))])
             for key in cache:
-                if any(k in key for k in self.activation_layers):
+                if key in self.harmless.keys() and cache[key].ndim == 3:
                     tensor = torch.mean(cache[key][:, -last_indices:, :],dim=1).to('cpu')
                     if key not in self.loss_harmless:
                         self.loss_harmless[key] = tensor
@@ -1035,7 +1197,9 @@ class ModelAbliterator:
             if measure_refusal > 1:
                 z_label.extend(self.measure_scores_from_logits(logits,measure_refusal)[0])
             for key in cache:
-                if activation_layers is None or any(k in key for k in activation_layers):
+                # Only (batch, pos, d) activations can be reduced over the last positions;
+                # attention patterns and per-head tensors (4-D) are skipped.
+                if cache[key].ndim == 3 and (activation_layers is None or any(k in key for k in activation_layers)):
                     tensor = torch.mean(cache[key][:,-last_indices:,:].to('cpu'),dim=1)
                     if key not in base:
                         base[key] = tensor
@@ -1058,6 +1222,8 @@ class ModelAbliterator:
         preserve_harmless: bool = True,
         stop_at_layer: int = None
     ):
+        # `reset` has no effect on the result: the harmful cache is always rebuilt,
+        # and the harmless cache is rebuilt unless preserve_harmless keeps it.
         if hasattr(self, "current_state"):
             logger.warning("Caching activations while using a context manager")
         if self.modified:
