@@ -333,3 +333,37 @@ def test_bfloat16_model_gets_float32_directions_and_keeps_weight_dtype(tokenizer
         ab.induce_refusal_dir(direction, layers=[2])
         assert ab.layer_mlp(1).dtype == torch.bfloat16 and ab.layer_attn(2).dtype == torch.bfloat16
     assert ab.layer_mlp(1).dtype == torch.bfloat16
+
+
+# --- research-derived options (opt-in) -----------------------------------
+
+def test_projected_directions_are_orthogonal_to_harmless_mean(cached):
+    plain, projected = cached.refusal_dirs(), cached.refusal_dirs(projected=True)
+    assert plain.keys() == projected.keys()
+    for key, v in projected.items():
+        harmless_mean = cached.calculate_mean_dirs(key)["harmless_mean"]
+        assert abs(v.norm().item() - 1.0) < 1e-4
+        assert abs(torch.dot(v, harmless_mean / harmless_mean.norm()).item()) < 1e-4
+    assert any(not torch.allclose(plain[k], projected[k], atol=1e-4) for k in plain)
+
+
+def test_preserve_norm_keeps_row_norms_and_orthogonality(cached):
+    direction = next(iter(cached.refusal_dirs().values()))
+    before_mlp, before_attn = cached.layer_mlp(1).clone(), cached.layer_attn(1).clone()
+    cached.apply_refusal_dirs([direction], layers=[1], preserve_norm=True)
+    for before, after in ((before_mlp, cached.layer_mlp(1)), (before_attn, cached.layer_attn(1))):
+        assert torch.allclose(before.norm(dim=-1), after.norm(dim=-1), rtol=1e-4, atol=1e-6)
+        assert (after @ direction).abs().max() < 1e-4
+        assert not torch.equal(before, after)
+
+
+def test_kl_divergence_zero_until_modified(cached):
+    baseline = cached.harmless_logprobs(N=1, batch_size=1)
+    assert baseline.shape == (1, cached.model.cfg.d_vocab)
+    assert abs(cached.kl_divergence(baseline, N=1, batch_size=1)) < 1e-6
+    with cached:
+        cached.apply_refusal_dirs([next(iter(cached.refusal_dirs().values()))])
+        assert cached.kl_divergence(baseline, N=1, batch_size=1) > 0
+    assert abs(cached.kl_divergence(baseline, N=1, batch_size=1)) < 1e-6
+    with pytest.raises(ValueError, match="same N"):
+        cached.kl_divergence(torch.zeros(3, 5), N=1)

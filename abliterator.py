@@ -584,7 +584,7 @@ class ModelAbliterator:
             raise KeyError(f"Activation '{act_name}' not found in cache. Run cache_activations first.")
         return self.calculate_mean_dirs(act_name, include_overall_mean=include_overall_mean)
 
-    def refusal_dirs(self, invert: bool = False) -> Dict[str, Float[Tensor, 'd_model']]:
+    def refusal_dirs(self, invert: bool = False, projected: bool = False) -> Dict[str, Float[Tensor, 'd_model']]:
         """Compute normalized refusal directions for all cached activations.
 
         The refusal direction is the difference between harmful and harmless mean
@@ -592,6 +592,9 @@ class ModelAbliterator:
 
         Args:
             invert: If True, compute harmless - harmful instead of harmful - harmless.
+            projected: If True, remove the component of each direction that lies
+                along the mean harmless activation before normalizing ("projected
+                abliteration"), so ablating it disturbs harmless behaviour less.
 
         Returns:
             Dict mapping activation names to normalized refusal direction tensors.
@@ -623,10 +626,18 @@ class ModelAbliterator:
             for key in self.harmful.keys()
             if key in harmless_keys and '.0.' not in key and self.harmful[key].shape[-1] == self.hidden_size
         }
+        harmless_means = {key: v['harmless_mean'] for key, v in refusal_dirs.items()}
         if invert:
             refusal_dirs = {key: v['harmless_mean'] - v['harmful_mean'] for key, v in refusal_dirs.items()}
         else:
             refusal_dirs = {key: v['harmful_mean'] - v['harmless_mean'] for key, v in refusal_dirs.items()}
+
+        if projected:
+            for key, v in refusal_dirs.items():
+                harmless_norm = harmless_means[key].norm()
+                if torch.isfinite(harmless_norm) and harmless_norm > 0:
+                    harmless_unit = harmless_means[key] / harmless_norm
+                    refusal_dirs[key] = v - torch.dot(v, harmless_unit) * harmless_unit
 
         # The '.0.' name-based exclusion above only catches block-indexed layer-0 keys
         # (e.g. 'blocks.0.hook_resid_pre'); other pre-transformer-block activations like
@@ -805,7 +816,8 @@ class ModelAbliterator:
         refusal_dirs: List[Float[Tensor, 'd_model']],
         W_O: bool = True,
         mlp: bool = True,
-        layers: List[int] = None
+        layers: List[int] = None,
+        preserve_norm: bool = False
     ):
         """Apply refusal directions to model weights.
 
@@ -816,6 +828,10 @@ class ModelAbliterator:
             W_O: Whether to modify attention output weights.
             mlp: Whether to modify MLP output weights.
             layers: List of layer indices to modify. Defaults to all layers except layer 0.
+            preserve_norm: If True, rescale every weight row back to its original
+                norm after removing the direction ("norm-preserving" ablation). The
+                rows stay orthogonal to the direction. Reported to help on some
+                models and hurt on others, so compare with kl_divergence().
         """
         if layers is None:
             layers = list(range(1, self.model.cfg.n_layers))
@@ -826,7 +842,12 @@ class ModelAbliterator:
                         matrix = modifying[1](layer)
                         refusal_dir = refusal_dir.to(matrix.device, matrix.dtype)
                         proj = einops.einsum(matrix, refusal_dir.view(-1, 1), '... d_model, d_model single -> ... single') * refusal_dir
-                        modifying[1](layer, matrix - proj)
+                        ablated = matrix - proj
+                        if preserve_norm:
+                            original_norms = matrix.float().norm(dim=-1, keepdim=True)
+                            ablated_norms = ablated.float().norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                            ablated = (ablated.float() * (original_norms / ablated_norms)).to(matrix.dtype)
+                        modifying[1](layer, ablated)
 
     def induce_refusal_dir(
         self,
@@ -937,6 +958,33 @@ class ModelAbliterator:
         negative_score = measure_fn(measure,negative_score)
         positive_score = measure_fn(measure,positive_score)
         return {'negative':negative_score.to('cpu'), 'positive':positive_score.to('cpu')}
+
+    def harmless_logprobs(self, N: int = 32, batch_size: int = 8) -> Float[Tensor, 'batch_size d_vocab']:
+        """Next-token log-probabilities for the first N harmless test prompts.
+
+        Take this on the unmodified model as the baseline for kl_divergence().
+        """
+        prompts = self.harmless_inst_test[:N]
+        # Tokenize together so every batch is padded identically to the baseline run.
+        toks = self.tokenize_instructions_fn(prompts)
+        out = []
+        for i in range(0, len(toks), batch_size):
+            logits = self.model(toks[i:i + batch_size])
+            out.append(torch.log_softmax(logits[:, -1, :].float(), dim=-1).to('cpu'))
+        return torch.cat(out, dim=0)
+
+    def kl_divergence(self, baseline: Float[Tensor, 'batch_size d_vocab'], N: int = 32, batch_size: int = 8) -> float:
+        """KL(baseline || current model) of next-token distributions on harmless prompts.
+
+        `baseline` is harmless_logprobs() from the unmodified model with the same N.
+        0 means the edit left harmless behaviour unchanged at the first generated
+        token; larger means more collateral change. This is the usual damage metric
+        for comparing ablations, alongside the refusal score.
+        """
+        current = self.harmless_logprobs(N=N, batch_size=batch_size)
+        if current.shape != baseline.shape:
+            raise ValueError(f"baseline shape {tuple(baseline.shape)} != current {tuple(current.shape)}; use the same N")
+        return F.kl_div(current, baseline, reduction='batchmean', log_target=True).item()
 
     def measure_scores_from_logits(
         self,

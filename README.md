@@ -136,6 +136,21 @@ my_model.apply_refusal_dirs([my_amazing_dir],layers=None)
 ```
 Note the `layers=None`. You can supply a list here to specify which layers you want to apply the refusal direction to. None applies it to every layer except layer 0 (and any blacklisted layer).
 
+### Optional variants, and measuring the damage
+Two refinements from later abliteration work are available as opt-in flags (defaults are unchanged):
+```python
+dirs = my_model.refusal_dirs(projected=True)   # "projected abliteration": drop the part of each direction that lies along the mean harmless activation
+my_model.apply_refusal_dirs([my_amazing_dir], preserve_norm=True)  # "norm-preserving": rescale each weight row back to its original norm afterwards
+```
+Neither is a guaranteed win — norm preservation in particular is reported to help some models and hurt others — so measure. The usual damage metric is the KL divergence of the next-token distribution on harmless prompts, before vs. after:
+```python
+baseline = my_model.harmless_logprobs(N=32)       # on the unmodified model
+with my_model:
+    my_model.apply_refusal_dirs([my_amazing_dir])
+    print(my_model.kl_divergence(baseline, N=32))  # 0 = harmless behaviour untouched; lower is better
+    print(my_model.test_dir(my_amazing_dir, N=32)) # ...weighed against the refusal scores
+```
+
 ### Blacklisting specific layers
 Sometimes some layers are troublesome no matter what you do. If you're worried about accidentally replacing it, you can blacklist it to prevent any alteration from occurring:
 ```python

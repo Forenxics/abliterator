@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Python library for transformer activation steering and ablation."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
 
 keywords = [
     "transformers",
@@ -25,7 +26,6 @@ maintainers = []
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -63,7 +63,7 @@ Repository = "https://github.com/Forenxics/abliterator"
 Issues = "https://github.com/Forenxics/abliterator/issues"
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
