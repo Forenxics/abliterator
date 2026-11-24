@@ -106,6 +106,9 @@ def main():
         dtype=dtype,
         chat_template=CHAT_TEMPLATES[args.chat_template],
     )
+    # TransformerLens holds its own converted copy of the weights; drop the
+    # HuggingFace one so a large model isn't kept in memory twice.
+    del hf_model
     print(f"    OK. d_model={ab.hidden_size}, n_layers={ab.model.cfg.n_layers}")
 
     print(f"[3/{TOTAL_STEPS}] generate_logits() with stop_at_eos on a mixed-length batch ...")

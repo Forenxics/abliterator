@@ -18,6 +18,10 @@ cd abliterator
 pip install -r requirements.txt
 ```
 
+Requires Python 3.10 or newer (a `transformer_lens` 3.x requirement). `pip install .` also works and installs the `abliterator` module.
+
+To run the tests (offline, a tiny randomly-initialised model, a few seconds): `pip install pytest && python -m pytest`.
+
 **Important dependency note:** this library uses TransformerLens's `HookedTransformer` API, which was **removed in TransformerLens 4.0** (replaced by a new `TransformerBridge` API). `requirements.txt`/`pyproject.toml` pin `transformer_lens>=3.0.0,<4.0.0` for exactly this reason — don't `pip install -U transformer_lens` on top of this, it'll break the import.
 
 ## Loading a model in
@@ -32,7 +36,7 @@ dataset = [abliterator.get_harmful_instructions(), abliterator.get_harmless_inst
 device = 'cuda'                             # optional: defaults to cuda
 n_devices = None                            # optional: when set to None, defaults to `torch.cuda.device_count()`
 cache_fname = 'my_cached_point.pth'         # optional: if you need to save where you left off, you can use `save_activations(filename)` which will write out a file. This is how you load that back in.
-activation_layers = ['resid_pre', 'resid_post', 'attn_out', 'mlp_out']  # optional: this is the library default. Set to None to cache ALL activation layer types instead.
+activation_layers = ['resid_pre', 'resid_post', 'attn_out', 'mlp_out']  # optional: this is the library default. Set to None to cache ALL activation layer types instead (hooks and direction lookups then use this default list).
 chat_template = None                        # optional: defaults to the Llama-3 instruction template. You can use a format string e.g. ("<system>{instruction}<end><assistant>") or a custom class with a `.format(instruction="")` function. See abliterator.ChatTemplate for a very basic structure.
 negative_toks = [4250]                      # optional, but highly recommended: ' cannot' in Llama's tokenizer. Tokens you don't want to be seeing. Defaults to a preset for Llama-3 models.
 positive_toks = [23371, 40914]              # optional, but highly recommended: ' Sure' and 'Sure' in Llama's tokenizer. Tokens you want to be seeing, basically. Defaults to a preset for Llama-3 models.
@@ -96,7 +100,9 @@ my_model.cache_activations(N=512,reset=True,preserve_harmless=True)
 
 ## Saving state
 Most of the advantage of this is a lot of groundwork has been laid to make it so you aren't repeating yourself 1000 times just to try one little experiment.
-`save_activations('file.pth')` will save your cached activations, and any currently applied modifications to the model's weights to a file so you can restore them next time you load up with `cache_fname='file.pth'` in your ModelAbliterator initialization.
+`save_activations('file.pth')` saves your cached activations, the weight edits you've applied (`apply_refusal_dirs` etc.) and any checkpoints. Passing `cache_fname='file.pth'` to `ModelAbliterator(...)` loads the activations back and re-applies those weight edits to the freshly loaded model.
+
+The file holds plain tensors and loads with `torch.load(weights_only=True)`. Cache files written by older versions contain pickled objects, which can run arbitrary code when loaded, so they are refused unless you pass `allow_unsafe_cache=True` — only do that for files you created yourself.
 
 ## Getting refusal directions from the cached activations
 Speaking of modding, here's a simple representation of how to pick, test, and actually apply a direction from a layer's activations:
@@ -105,17 +111,17 @@ refusal_dirs = my_model.refusal_dirs()
 testing_dir = refusal_dirs['blocks.18.hook_resid_pre']
 my_model.test_dir(testing_dir, N=32, use_hooks=True) # I recommend use_hooks=True for large models as it can slow things down otherwise, but use_hooks=False can give you more precise scoring to an actual weights modification
 ```
-`test_dir` will apply your refusal_dir to the model temporarily, and run against N samples of test data, and return a composite (negative_score, positive_score) from those runs. Generally, you want negative_score to go down, positive_score to go up.
+`test_dir` will apply your refusal_dir to the model temporarily, run against N samples of test data, and return `{'negative': score, 'positive': score}` from those runs. Generally, you want negative_score to go down, positive_score to go up.
 
 ### Testing lots of refusal directions
 
 This is one of the functions included in the library, but it's also useful for showing how this can be generalized to test a whole bunch of directions.
 ```python
-    def find_best_refusal_dir(N=4, use_hooks=True, invert=False):
+    def find_best_refusal_dir(self, N=4, use_hooks=True, invert=False):
         dirs = self.refusal_dirs(invert=invert)
         scores = []
         for direction in tqdm(dirs.items()):
-            score = self.test_dir(direction[1],N=N,use_hooks=use_hooks)[0]
+            score = self.test_dir(direction[1],N=N,use_hooks=use_hooks)['negative']
             scores.append((score,direction))
         return sorted(scores,key=lambda x:x[0])
 
@@ -125,10 +131,10 @@ This is one of the functions included in the library, but it's also useful for s
 
 And now, to apply it!
 ```python
-my_amazing_dir = find_best_refusal_dir()[0]
+score, (act_name, my_amazing_dir) = my_model.find_best_refusal_dir()[0]  # best first
 my_model.apply_refusal_dirs([my_amazing_dir],layers=None)
 ```
-Note the `layers=None`. You can supply a list here to specify which layers you want to apply the refusal direction to. None will apply it to all writable layers.
+Note the `layers=None`. You can supply a list here to specify which layers you want to apply the refusal direction to. None applies it to every layer except layer 0 (and any blacklisted layer).
 
 ### Blacklisting specific layers
 Sometimes some layers are troublesome no matter what you do. If you're worried about accidentally replacing it, you can blacklist it to prevent any alteration from occurring:
